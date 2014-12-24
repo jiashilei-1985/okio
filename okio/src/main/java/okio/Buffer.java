@@ -45,6 +45,9 @@ import static okio.Util.reverseBytesLong;
  * This class avoids zero-fill and GC churn by pooling byte arrays.
  */
 public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
+  private static final byte[] DIGITS =
+      { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+
   Segment head;
   long size;
 
@@ -405,6 +408,113 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
   @Override public long readLongLe() {
     return Util.reverseBytesLong(readLong());
+  }
+
+  @Override public long readDecimalLong() {
+    if (size == 0) throw new IllegalStateException("size == 0");
+
+    // This value is always built negatively in order to accommodate Long.MIN_VALUE.
+    long value = 0;
+    int seen = 0;
+    boolean negative = false;
+
+    long overflowZone = Long.MIN_VALUE / 10;
+    long overflowDigit = (Long.MIN_VALUE % 10) + 1;
+
+    outer: do {
+      Segment segment = head;
+
+      byte[] data = segment.data;
+      int pos = segment.pos;
+      int limit = segment.limit;
+
+      for (; pos < limit; pos++, seen++) {
+        byte b = data[pos];
+        if (b >= '0' && b <= '9') {
+          int digit = '0' - b;
+
+          // Detect when the digit would cause an overflow.
+          if (value < overflowZone || value == overflowZone && digit < overflowDigit) {
+            Buffer buffer = new Buffer().writeDecimalLong(value).writeByte(b);
+            if (!negative) buffer.readByte(); // Skip negative sign.
+            throw new NumberFormatException("Number too large: " + buffer.readUtf8());
+          }
+          value *= 10;
+          value += digit;
+        } else if (b == '-' && seen == 0) {
+          negative = true;
+          overflowDigit -= 1;
+        } else {
+          if (seen == 0) {
+            throw new NumberFormatException(
+                "Expected leading [0-9] or '-' character but was 0x" + Integer.toHexString(b));
+          }
+          break outer;
+        }
+      }
+
+      if (pos == limit) {
+        head = segment.pop();
+        SegmentPool.INSTANCE.recycle(segment);
+      } else {
+        segment.pos = pos;
+      }
+    } while (head != null);
+
+    size -= seen;
+    return negative ? value : -value;
+  }
+
+  @Override public long readHexadecimalUnsignedLong() {
+    if (size == 0) throw new IllegalStateException("size == 0");
+
+    long value = 0;
+    int seen = 0;
+
+    outer: do {
+      Segment segment = head;
+
+      byte[] data = segment.data;
+      int pos = segment.pos;
+      int limit = segment.limit;
+
+      for (; pos < limit; pos++) {
+        int digit;
+
+        byte b = data[pos];
+        if (b >= '0' && b <= '9') {
+          digit = b - '0';
+        } else if (b >= 'a' && b <= 'f') {
+          digit = b - 'a' + 10;
+        } else if (b >= 'A' && b <= 'F') {
+          digit = b - 'A' + 10; // We never write uppercase, but we support reading it.
+        } else {
+          if (seen == 0) {
+            throw new NumberFormatException(
+                "Expected leading [0-9a-fA-F] character but was 0x" + Integer.toHexString(b));
+          }
+          break outer;
+        }
+
+        if (++seen > 16) {
+          Buffer buffer = new Buffer().writeHexadecimalUnsignedLong(value).writeByte(b);
+          throw new NumberFormatException("Number too large: " + buffer.readUtf8());
+        }
+
+        value <<= 4;
+        value |= digit;
+      }
+
+      if (pos == limit) {
+        head = segment.pop();
+        SegmentPool.INSTANCE.recycle(segment);
+      } else {
+        segment.pos = pos;
+      }
+    } while (head != null);
+
+    size -= seen;
+    return value;
   }
 
   @Override public ByteString readByteString() {
@@ -773,6 +883,97 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
   @Override public Buffer writeLongLe(long v) {
     return writeLong(reverseBytesLong(v));
+  }
+
+  @Override public Buffer writeDecimalLong(long v) {
+    if (v == 0) {
+      // Both a shortcut and required since the following code can't handle zero.
+      return writeByte('0');
+    }
+
+    boolean negative = false;
+    if (v < 0) {
+      v = -v;
+      if (v < 0) { // Only true for Long.MIN_VALUE.
+        return writeUtf8("-9223372036854775808");
+      }
+      negative = true;
+    }
+
+    // Binary search for character width which favors matching lower numbers.
+    int width = //
+          v < 100000000L
+        ? v < 10000L
+        ? v < 100L
+        ? v < 10L ? 1 : 2
+        : v < 1000L ? 3 : 4
+        : v < 1000000L
+        ? v < 100000L ? 5 : 6
+        : v < 10000000L ? 7 : 8
+        : v < 1000000000000L
+        ? v < 10000000000L
+        ? v < 1000000000L ? 9 : 10
+        : v < 100000000000L ? 11 : 12
+        : v < 1000000000000000L
+        ? v < 10000000000000L ? 13
+        : v < 100000000000000L ? 14 : 15
+        : v < 100000000000000000L
+        ? v < 10000000000000000L ? 16 : 17
+        : v < 1000000000000000000L ? 18 : 19;
+    if (negative) {
+      ++width;
+    }
+
+    Segment tail = writableSegment(width);
+    byte[] data = tail.data;
+    int pos = tail.limit + width; // We write backwards from right to left.
+    while (v != 0) {
+      int digit = (int) (v % 10);
+      data[--pos] = DIGITS[digit];
+      v /= 10;
+    }
+    if (negative) {
+      data[--pos] = '-';
+    }
+
+    tail.limit += width;
+    this.size += width;
+    return this;
+  }
+
+  @Override public Buffer writeHexadecimalUnsignedLong(long v) {
+    if (v == 0) {
+      // Both a shortcut and required since the following code can't handle zero.
+      return writeByte('0');
+    }
+
+    // Binary search for character width which favors matching lower numbers.
+    int width =  //
+          (v & 0xFFFFFFFF00000000L) == 0
+        ? (v & 0xFFFFFFFFFFFF0000L) == 0
+        ? (v & 0xFFFFFFFFFFFFFF00L) == 0
+        ? (v & 0xFFFFFFFFFFFFFFF0L) == 0 ? 1 : 2
+        : (v & 0xFFFFFFFFFFFFF000L) == 0 ? 3 : 4
+        : (v & 0xFFFFFFFFFF000000L) == 0
+        ? (v & 0xFFFFFFFFFFF00000L) == 0 ? 5 : 6
+        : (v & 0xFFFFFFFFF0000000L) == 0 ? 7 : 8
+        : (v & 0xFFFF000000000000L) == 0
+        ? (v & 0xFFFFFF0000000000L) == 0
+        ? (v & 0xFFFFFFF000000000L) == 0 ? 9 : 10
+        : (v & 0xFFFFF00000000000L) == 0 ? 11 : 12
+        : (v & 0xFF00000000000000L) == 0
+        ? (v & 0xFFF0000000000000L) == 0 ? 13 : 14
+        : (v & 0xF000000000000000L) == 0 ? 15 : 16;
+
+    Segment tail = writableSegment(width);
+    byte[] data = tail.data;
+    for (int pos = tail.limit + width - 1, start = tail.limit; pos >= start; pos--) {
+      data[pos] = DIGITS[(int) (v & 0xF)];
+      v >>>= 4;
+    }
+    tail.limit += width;
+    size += width;
+    return this;
   }
 
   /**
